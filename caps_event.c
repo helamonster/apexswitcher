@@ -20,6 +20,8 @@ XftFont            *font;                         // font used for all text rend
 XftColor            color;                        // normal text color (black)
 XftColor            highlight_color;              // highlighted item color (blue)
 XftColor            grey_color;                   // dimmed text color for placeholder messages
+GC                  yellow_gc          = NULL;    // GC used to fill the active viewport cell background (full yellow)
+GC                  dim_yellow_gc      = NULL;    // GC used to fill inactive viewport cells (50% yellow)
 char              **desktop_names      = NULL;    // array of desktop name strings
 int                 num_desktops       = 0;       // total number of desktops
 int                 current_desktop    = 0;       // index of the currently active desktop
@@ -67,9 +69,11 @@ void cleanup ()
 		XFlush ( dpy );
 
 		// Free Xft drawing resources.
-		if ( draw )  XftDrawDestroy ( draw );
-		if ( draw2 ) XftDrawDestroy ( draw2 );
-		if ( font )  XftFontClose ( dpy , font );
+		if ( draw )     XftDrawDestroy ( draw );
+		if ( draw2 )    XftDrawDestroy ( draw2 );
+		if ( font )     XftFontClose ( dpy , font );
+		if ( yellow_gc )     XFreeGC ( dpy , yellow_gc );
+		if ( dim_yellow_gc ) XFreeGC ( dpy , dim_yellow_gc );
 
 		// Free the window list.
 		if ( window_ids ) free ( window_ids );
@@ -229,49 +233,52 @@ void refresh_current_state ( Display *dpy , Window root )
 		XFree ( data );
 	}
 
-	// Read the (x, y) viewport offset for the current desktop.
+	// Read the full _NET_DESKTOP_VIEWPORT array (one x,y pair per desktop).
 	unsigned char *vpdata = NULL; // raw _NET_DESKTOP_VIEWPORT property data
-	XGetWindowProperty ( dpy , root , _NET_DESKTOP_VIEWPORT , current_desktop * 2 , 2 , False , XA_CARDINAL ,
+	XGetWindowProperty ( dpy , root , _NET_DESKTOP_VIEWPORT , 0 , num_desktops * 2 , False , XA_CARDINAL ,
 	                     & actual_type , & actual_format , & nitems , & bytes_after , & vpdata );
 
 	if ( vpdata && nitems >= 2 )
 	{
-		long vp_x = ( ( long * ) vpdata )[0]; // horizontal scroll offset in pixels
-		long vp_y = ( ( long * ) vpdata )[1]; // vertical scroll offset in pixels
-		XFree ( vpdata );
-		current_vx = vp_x;
+		long screen_height = DisplayHeight ( dpy , DefaultScreen ( dpy ) ); // physical screen height in pixels
 
-		int found_viewport = 0; // set to 1 once the matching viewport row is identified
-
-		// Xinerama mode: match the offset against physical screen origins.
-		if ( screens )
+		// Map every desktop to its current viewport index.
+		for ( int d = 0 ; d < num_desktops && ( unsigned long ) d * 2 + 1 < nitems ; ++ d )
 		{
-			for ( int i = 0 ; i < num_viewports ; ++ i )
+			long vp_x = ( ( long * ) vpdata )[ d * 2 ];     // X offset for desktop d
+			long vp_y = ( ( long * ) vpdata )[ d * 2 + 1 ]; // Y offset for desktop d
+
+			int found_viewport = 0; // set to 1 once the matching viewport row is identified
+
+			// Xinerama mode: match offset against physical screen origins.
+			if ( screens )
 			{
-				if ( vp_x == screens[i].x_org && vp_y == screens[i].y_org )
+				for ( int s = 0 ; s < num_viewports ; ++ s )
 				{
-					current_viewport = i;
-					found_viewport   = 1;
-					break;
+					if ( vp_x == screens[s].x_org && vp_y == screens[s].y_org )
+					{
+						if ( desktop_to_viewport_map ) desktop_to_viewport_map[d] = s;
+						found_viewport = 1;
+						break;
+					}
 				}
 			}
-		}
 
-		// Virtual viewport mode: derive row index by dividing Y offset by screen height.
-		if ( ! found_viewport )
-		{
-			long screen_height = DisplayHeight ( dpy , DefaultScreen ( dpy ) ); // physical screen height in pixels
-			if ( screen_height > 0 )
+			// Virtual viewport mode: derive index from Y offset.
+			if ( ! found_viewport && screen_height > 0 )
 			{
-				current_viewport = vp_y / screen_height;
+				if ( desktop_to_viewport_map ) desktop_to_viewport_map[d] = vp_y / screen_height;
+			}
+
+			// Keep current_viewport and current_vx in sync for the active desktop.
+			if ( d == current_desktop )
+			{
+				current_vx      = vp_x;
+				current_viewport = desktop_to_viewport_map ? desktop_to_viewport_map[d] : 0;
 			}
 		}
-	}
 
-	// Record the current viewport for this desktop.
-	if ( desktop_to_viewport_map )
-	{
-		desktop_to_viewport_map[current_desktop] = current_viewport;
+		XFree ( vpdata );
 	}
 }
 
@@ -625,9 +632,21 @@ void draw_desktops ()
 			XGlyphInfo extents; // glyph metrics for this label
 			XftTextExtentsUtf8 ( dpy , font , ( XftChar8 * ) buf , strlen ( buf ) , & extents );
 
-			// Highlight the label for the active desktop on the active viewport row.
-			int       active = ( i == current_desktop && v == current_viewport ); // 1 if this cell is current
-			XftColor *clr    = active ? & highlight_color : & color;               // color based on active state
+			// Highlight the active viewport row for each desktop column independently.
+			int active    = ( i == current_desktop && v == current_viewport ); // 1 if this is the current cell
+			int vp_active = ( v == desktop_to_viewport_map[i] );               // 1 if this row is that desktop's viewport
+			XftColor *clr = active ? & highlight_color : & color;              // text color based on active state
+
+			// Fill yellow only on the active-viewport row for this desktop; full if current, dim if not.
+			if ( vp_active )
+			{
+				XFillRectangle ( dpy , win , active ? yellow_gc : dim_yellow_gc ,
+				                 x - 2 ,
+				                 y_baseline - font->ascent - ( row_padding / 2 ) ,
+				                 extents.xOff + 4 ,
+				                 row_height );
+			}
+
 			XftDrawStringUtf8 ( draw , clr , font , x , y_baseline ,
 			                    ( XftChar8 * ) buf , strlen ( buf ) );
 			x += extents.xOff + spacing;
@@ -852,6 +871,18 @@ int main ( int argc , char *argv[] )
 	XftColorAllocValue ( dpy , DefaultVisual ( dpy , screen_idx ) , DefaultColormap ( dpy , screen_idx ) , & xr_black     , & color           );
 	XftColorAllocValue ( dpy , DefaultVisual ( dpy , screen_idx ) , DefaultColormap ( dpy , screen_idx ) , & xr_highlight , & highlight_color );
 	XftColorAllocValue ( dpy , DefaultVisual ( dpy , screen_idx ) , DefaultColormap ( dpy , screen_idx ) , & xr_grey      , & grey_color      );
+
+	// Allocate yellow (active cell) and cyan (inactive viewport cell) and create GCs for each.
+	XColor yellow_xc; // full yellow color entry in the colormap
+	XColor cyan_xc;   // cyan color entry in the colormap
+	XColor dummy_xc;  // closest available color returned by the server (unused)
+	XAllocNamedColor ( dpy , DefaultColormap ( dpy , screen_idx ) , "yellow" , & yellow_xc , & dummy_xc );
+	XAllocNamedColor ( dpy , DefaultColormap ( dpy , screen_idx ) , "cyan"   , & cyan_xc   , & dummy_xc );
+	XGCValues gcv;                        // GC attribute struct
+	gcv.foreground = yellow_xc.pixel;     // full yellow foreground pixel
+	yellow_gc     = XCreateGC ( dpy , win , GCForeground , & gcv );
+	gcv.foreground = cyan_xc.pixel; // cyan foreground pixel for inactive viewport cells
+	dim_yellow_gc = XCreateGC ( dpy , win , GCForeground , & gcv );
 
 	// Create the window switcher overlay (initially 1x1; resized each time it is shown).
 	win2  = XCreateWindow ( dpy , root , 0 , 0 , 1 , 1 , 1 ,
